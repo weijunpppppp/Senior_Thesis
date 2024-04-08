@@ -36,6 +36,9 @@ typedef struct stats {
 typedef struct flthread_info {
     ull banned_until;
     ull next_acquire_time;
+    int bad_acquires; 
+    int lock_acquires;
+    float detector; // detector = bad_acquires/lock_acquires
     ull weight;
     ull slice;
     ull start_ticks;
@@ -94,6 +97,9 @@ static flthread_info_t *flthread_info_create(fairlock_t *lock, int weight) {
     info = malloc(sizeof(flthread_info_t));
     info->banned_until = rdtsc();
     info->next_acquire_time = rdtsc();
+    info->bad_acquires = 0;
+    info->lock_acquires = 0;
+    info->detector = 1;
     if (weight == 0) {
         int prio = getpriority(PRIO_PROCESS, 0);
         weight = prio_to_weight[prio+20];
@@ -136,9 +142,16 @@ void fairlock_acquire(fairlock_t *lock) {
         pthread_setspecific(lock->flthread_info_key, info);
     }
 
+    if (info->lock_acquires > 1000){
+        info->lock_acquires = 0;
+        info->bad_acquires = 0;
+    }
+    info->lock_acquires++;
     if ((now = rdtsc()) <= info->next_acquire_time){
+        info->bad_acquires++;
         info->bad++; 
     }
+    info->detector = (double)info->bad_acquires/info->lock_acquires;
 
     if (readvol(lock->slice_valid)) {
         ull curr_slice = lock->slice;

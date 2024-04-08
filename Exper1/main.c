@@ -145,7 +145,8 @@ void *worker(void *arg) {
             "  banned(actual) %llu\n"
             "  banned %llu\n"
             "  elapse %llu\n"
-            "  bad %llu\n",
+            "  bad %llu\n"
+            "  detector %10.3f\n",
             task->lock_acquires - info->stat.reenter,
             info->stat.own_slice_wait,
             info->stat.prev_slice_wait,
@@ -156,7 +157,8 @@ void *worker(void *arg) {
             info->stat.banned_time,
             info->banned_until-info->stat.start,
             info->start_ticks-info->stat.start,
-            info->bad);
+            info->bad,
+            info->detector);
 #endif
     return 0;
 }
