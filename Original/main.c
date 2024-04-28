@@ -1,5 +1,4 @@
 #define _GNU_SOURCE
-#define DEBUG
 #include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h>
@@ -10,6 +9,7 @@
 #include <sys/syscall.h>
 #include <inttypes.h>
 #define gettid() syscall(SYS_gettid)
+#define DEBUG
 #include "rdtsc.h"
 #include "lock.h"
 
@@ -146,13 +146,6 @@ void *worker(void *arg) {
             "  banned %llu\n"
             "  elapse %llu\n"
             "  bad %llu\n"
-            "  here1 %llu\n"
-            "  here2 %llu\n"
-            "  here3 %llu\n"
-            "  here4 %llu\n"
-            "  here5 %llu\n"
-            "  here6 %llu\n"
-            "  here7 %llu\n"
             "  detector %10.3f\n",
             task->lock_acquires - info->stat.reenter,
             info->stat.own_slice_wait,
@@ -165,13 +158,6 @@ void *worker(void *arg) {
             info->banned_until-info->stat.start,
             info->start_ticks-info->stat.start,
             info->bad,
-            info->here1,
-            info->here2,
-            info->here3,
-            info->here4,
-            info->here5,
-            info->here6,
-            info->here7,
             info->detector);
 #endif
     return 0;

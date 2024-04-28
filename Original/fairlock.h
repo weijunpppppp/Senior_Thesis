@@ -36,19 +36,9 @@ typedef struct stats {
 typedef struct flthread_info {
     ull banned_until;
     ull next_acquire_time;
-    //for debug///////////////////////
-    ull here1;
-    ull here2;
-    ull here3;
-    ull here4;
-    ull here5;
-    ull here6;
-    ull here7;
-    //for debug//////////////////////
     int bad_acquires; 
     int lock_acquires;
     float detector; // detector = bad_acquires/lock_acquires
-    int in_subq; // whether the thread is (good && it is in the currect subqueue)
     ull weight;
     ull slice;
     ull start_ticks;
@@ -68,20 +58,14 @@ enum qnode_state {
 
 typedef struct qnode {
     int state __attribute__ ((aligned (CACHELINE)));
-    int is_good __attribute__ ((aligned (CACHELINE)));
-    int in_subq __attribute__ ((aligned (CACHELINE)));
     struct qnode *next __attribute__ ((aligned (CACHELINE)));
 } qnode_t __attribute__ ((aligned (CACHELINE)));
 
 typedef struct fairlock {
     qnode_t *qtail __attribute__ ((aligned (CACHELINE)));
     qnode_t *qnext __attribute__ ((aligned (CACHELINE)));
-    qnode_t *sub_qfirst __attribute__ ((aligned (CACHELINE)));
-    qnode_t *sub_qnext __attribute__ ((aligned (CACHELINE)));
     ull slice __attribute__ ((aligned (CACHELINE)));
-    ull sub_slice __attribute__ ((aligned (CACHELINE)));
     int slice_valid __attribute__ ((aligned (CACHELINE)));
-    int sub_slice_holding __attribute__ ((aligned (CACHELINE)));
     pthread_key_t flthread_info_key;
     ull total_weight;
 } fairlock_t __attribute__ ((aligned (CACHELINE)));
@@ -99,13 +83,9 @@ int fairlock_init(fairlock_t *lock) {
 
     lock->qtail = NULL;
     lock->qnext = NULL;
-    lock->sub_qfirst = NULL;
-    lock->sub_qnext = NULL;
     lock->total_weight = 0;
     lock->slice = 0;
-    lock->sub_slice = 0;
     lock->slice_valid = 0;
-    lock->sub_slice_holding = 0;
     if (0 != (rc = pthread_key_create(&lock->flthread_info_key, NULL))) {
         return rc;
     }
@@ -117,19 +97,9 @@ static flthread_info_t *flthread_info_create(fairlock_t *lock, int weight) {
     info = malloc(sizeof(flthread_info_t));
     info->banned_until = rdtsc();
     info->next_acquire_time = rdtsc();
-    info->bad_acquires = 1;
+    info->bad_acquires = 0;
     info->lock_acquires = 0;
     info->detector = 1;
-    info->in_subq = 0;
-    //for debug///////////////////////
-    info->here1 = 0;
-    info->here2 = 0;
-    info->here3 = 0;
-    info->here4 = 0;
-    info->here5 = 0;
-    info->here6 = 0;
-    info->here7 = 0;
-    //for debug//////////////////////
     if (weight == 0) {
         int prio = getpriority(PRIO_PROCESS, 0);
         weight = prio_to_weight[prio+20];
@@ -172,9 +142,9 @@ void fairlock_acquire(fairlock_t *lock) {
         pthread_setspecific(lock->flthread_info_key, info);
     }
 
-    if (info->lock_acquires > 100){
+    if (info->lock_acquires > 1000){
         info->lock_acquires = 0;
-        info->bad_acquires = 1;
+        info->bad_acquires = 0;
     }
     info->lock_acquires++;
     if ((now = rdtsc()) <= info->next_acquire_time){
@@ -183,71 +153,11 @@ void fairlock_acquire(fairlock_t *lock) {
     }
     info->detector = (double)info->bad_acquires/info->lock_acquires;
 
-    if (info->detector >= 0.5 && info->in_subq == 1){
-        info->in_subq = 0;
-        goto begin;
-    }
-
     if (readvol(lock->slice_valid)) {
         ull curr_slice = lock->slice;
-        qnode_t *succ = readvol(lock->qnext);
-    
-        if (info->detector<0.5 && info->in_subq == 1 && (now = rdtsc()) < curr_slice){
-            info->here1++;
-            if (rdtsc()>= lock->slice){
-                goto begin;
-            }
-
-            while (0 == __sync_bool_compare_and_swap(&lock->sub_slice_holding, 0, 1)){
-                info->here6++;
-                curr_slice = lock->slice;
-                if (rdtsc()>= lock->slice){
-                    goto begin;
-                }
-                ull slice_left = curr_slice - rdtsc();
-                struct timespec timeout = {
-                    .tv_sec = 0, // slice will be less then 1 sec
-                    .tv_nsec = (slice_left / (CYCLE_PER_US * SLEEP_GRANULARITY)) * SLEEP_GRANULARITY * 1000,
-                };
-                //todo: something wrong here!!!!!!!!!!!!!!!!!!!!!!!!!!!
-                futex(&lock->sub_slice_holding, FUTEX_WAIT_PRIVATE, 1, &timeout);
-                info->here3++;
-                if (rdtsc()>= lock->slice){
-                    info->here2++;
-                    lock->sub_slice_holding = 0;
-                    futex(&lock->sub_slice_holding, FUTEX_WAKE_PRIVATE, 1, NULL);
-                    goto begin;
-                }
-            }
-
-
-            //invariant: current thread grad the sub_slice lock
-            if (NULL == succ){
-                if (__sync_bool_compare_and_swap(&lock->qtail, NULL, flqnode(lock)))
-                    goto reenter;
-                spin_then_yield(SPIN_LIMIT, (now = rdtsc()) < curr_slice && NULL == (succ = readvol(lock->qnext)));
-#ifdef DEBUG
-                info->stat.own_slice_wait += rdtsc() - now;
-#endif
-                if (now >= curr_slice){
-                    lock->sub_slice_holding = 0;
-                    futex(&lock->sub_slice_holding, FUTEX_WAKE_PRIVATE, 1, NULL);
-                    goto begin;  
-                }      
-            }
-
-            if (succ != NULL && succ->is_good){
-                succ->in_subq = 1;
-            }
-
-            if (succ->state < RUNNABLE || __sync_bool_compare_and_swap(&succ->state, RUNNABLE, NEXT)) {
-                goto reenter;
-            }
-        }
-
-
         // If owner of current slice, try to reenter at the beginning of the queue
-        else if (curr_slice == info->slice && (now = rdtsc()) < curr_slice) {
+        if (curr_slice == info->slice && (now = rdtsc()) < curr_slice) {
+            qnode_t *succ = readvol(lock->qnext);
             if (NULL == succ) {
                 if (__sync_bool_compare_and_swap(&lock->qtail, NULL, flqnode(lock)))
                     goto reenter;
@@ -259,11 +169,8 @@ void fairlock_acquire(fairlock_t *lock) {
                 if (now >= curr_slice)
                     goto begin;
             }
-            
             // if state < RUNNABLE, it won't become RUNNABLE unless someone releases lock,
             // but as no one is holding the lock, there is no race
-
-            //todo: here need to introduce and merge next good thread
             if (succ->state < RUNNABLE || __sync_bool_compare_and_swap(&succ->state, RUNNABLE, NEXT)) {
 reenter:
 #ifdef DEBUG
@@ -299,21 +206,11 @@ begin:
     }
 
     qnode_t n = { 0 };
-    if (info->detector < 0.5){
-        n.is_good = 1;
-    }else{
-        n.is_good = 0;
-    }
     while (1) {
         qnode_t *prev = readvol(lock->qtail);
         if (__sync_bool_compare_and_swap(&lock->qtail, prev, &n)) {
             // enter the lock queue
             if (NULL == prev) {
-                if (n.is_good){
-                    info->here4++;
-                    info->in_subq = 1;
-                    n.in_subq = 1;
-                }
                 n.state = RUNNABLE;
                 lock->qnext = &n;
             } else {
@@ -321,12 +218,7 @@ begin:
                     n.state = NEXT;
                     prev->next = &n;
                 } else {
-                    //todo: here2 and here3
                     prev->next = &n;
-                    if (prev->in_subq = 1 && n.is_good){
-                        info->in_subq = 1;
-                        n.in_subq = 1;
-                    }
                     // wait until we become the next runnable
 #ifdef DEBUG
                     now = rdtsc();
@@ -344,77 +236,6 @@ begin:
             // wait until the current slice expires
             int slice_valid;
             ull curr_slice;
-            //todo: here need to divide in different cases 
-            if (prev == flqnode(lock) && n.is_good == 1){
-                while ((slice_valid = readvol(lock->slice_valid)) && (now = rdtsc()) + SLEEP_GRANULARITY < (curr_slice = readvol(lock->slice))) {
-                    ull slice_left = curr_slice - now;
-                    struct timespec timeout = {
-                        .tv_sec = 0, // slice will be less then 1 sec
-                        .tv_nsec = (slice_left / (CYCLE_PER_US * SLEEP_GRANULARITY)) * SLEEP_GRANULARITY * 1000,
-                    };
-                    futex(&lock->sub_slice_holding, FUTEX_WAIT_PRIVATE, 1, &timeout);
-                    if (1 == __sync_bool_compare_and_swap(&lock->sub_slice_holding, 0, 1)){
-                        n.state=RUNNABLE;
-                        break;
-                    }
-                }
-                if (rdtsc() >= readvol(lock->slice)){
-                    lock->slice_valid = 0;
-                    n.in_subq = 1;
-                    info->in_subq = 1;
-                }
-                else{
-                    if (n.in_subq == 0){
-                        if (slice_valid) {
-                            spin_then_yield(SPIN_LIMIT, (slice_valid = readvol(lock->slice_valid)) && rdtsc() < readvol(lock->slice));
-                            if (slice_valid)
-                                lock->slice_valid = 0;   
-                        }
-                    }
-                }
-
-            }
-            //todo: do I need to consider the case: prev ==flqnode(lock) && n.isgood = 0
-            //todo: consider change the place of grabbing sublock
-            else if (prev != NULL && prev->in_subq && n.in_subq){
-                while((now = rdtsc()) < (curr_slice = readvol(lock->slice))){
-                    ull slice_left = curr_slice - now;
-                    struct timespec timeout = {
-                        .tv_sec = 0, // slice will be less then 1 sec
-                        .tv_nsec = (slice_left / (CYCLE_PER_US * SLEEP_GRANULARITY)) * SLEEP_GRANULARITY * 1000,
-                    };
-                    futex(&lock->sub_slice_holding, FUTEX_WAIT_PRIVATE, 1, &timeout);
-                    if (1 == __sync_bool_compare_and_swap(&lock->sub_slice_holding, 0, 1)){
-                        n.state = RUNNABLE;
-                        break;
-                    }
-                }
-                if (rdtsc() >= readvol(lock->slice)){
-                    lock->slice_valid = 0;
-                }
-            }
-            else if (prev == NULL && n.is_good){
-                info->here7++;
-                // wait for the sub lock
-                while((now = rdtsc()) < (curr_slice = readvol(lock->slice))){
-                    ull slice_left = curr_slice - now;
-                    struct timespec timeout = {
-                        .tv_sec = 0, // slice will be less then 1 sec
-                        .tv_nsec = (slice_left / (CYCLE_PER_US * SLEEP_GRANULARITY)) * SLEEP_GRANULARITY * 1000,
-                    };
-                    futex(&lock->sub_slice_holding, FUTEX_WAIT_PRIVATE, 1, &timeout);
-                    if (1 == __sync_bool_compare_and_swap(&lock->sub_slice_holding, 0, 1)){
-                        n.state=RUNNABLE;
-                        break;
-                    }
-                }
-                if (rdtsc() >= readvol(lock->slice)){
-                    lock->slice_valid = 0;
-                }
-            }
-
-            else{
-                info->here5++;
             while ((slice_valid = readvol(lock->slice_valid)) && (now = rdtsc()) + SLEEP_GRANULARITY < (curr_slice = readvol(lock->slice))) {
                 ull slice_left = curr_slice - now;
                 struct timespec timeout = {
@@ -431,19 +252,13 @@ begin:
                 if (slice_valid)
                     lock->slice_valid = 0;
             }
-            }
             // invariant: rdtsc() >= curr_slice && lock->slice_valid == 0
 
 #ifdef DEBUG
             now = rdtsc();
 #endif
             // spin until RUNNABLE and try to grab the lock
-
-
             spin_then_yield(SPIN_LIMIT, RUNNABLE != readvol(n.state) || 0 == __sync_bool_compare_and_swap(&n.state, RUNNABLE, RUNNING));
-
-
-
             // invariant: n.state == RUNNING
 #ifdef DEBUG
             info->stat.runnable_wait += rdtsc() - now;
@@ -470,12 +285,6 @@ begin:
             info->slice = now + FAIRLOCK_GRANULARITY;
             lock->slice = info->slice;
             lock->slice_valid = 1;
-            if (n.is_good){
-                if (prev == NULL || n.in_subq == 1){
-                    lock->sub_slice_holding = 1;
-                    info->in_subq = 1;
-                }
-            }
             // wake up successor if necessary
             if (succ) {
                 succ->state = NEXT;
@@ -495,10 +304,8 @@ void fairlock_release(fairlock_t *lock) {
 
     qnode_t *succ = lock->qnext;
     if (NULL == succ) {
-        if (__sync_bool_compare_and_swap(&lock->qtail, flqnode(lock), NULL)){
+        if (__sync_bool_compare_and_swap(&lock->qtail, flqnode(lock), NULL))
             goto accounting;
-
-        }
 #ifdef DEBUG
         succ_start = rdtsc();
 #endif
@@ -507,12 +314,7 @@ void fairlock_release(fairlock_t *lock) {
         succ_end = rdtsc();
 #endif
     }
-    // if (NULL == succ && NULL != sub_succ){
-    //     sub_succ->sub_state = RUNNABLE;
-    // }
-
     succ->state = RUNNABLE;
-    //futex(&succ->sub_state, FUTEX_WAKE_PRIVATE, 1, NULL);
 
 accounting:
     // invariant: NULL == succ || succ->state = RUNNABLE
@@ -522,9 +324,6 @@ accounting:
     info->banned_until += cs * (__atomic_load_n(&lock->total_weight, __ATOMIC_RELAXED) / info->weight);
     info->next_acquire_time = now + cs * ((__atomic_load_n(&lock->total_weight, __ATOMIC_RELAXED) / (double)info->weight)) - cs;
     info->banned = now < info->banned_until;
-
-    lock->sub_slice_holding = 0;
-    futex(&lock->sub_slice_holding, FUTEX_WAKE_PRIVATE, 1, NULL);
 
     if (info->banned) {
         if (__sync_bool_compare_and_swap(&lock->slice_valid, 1, 0)) {
