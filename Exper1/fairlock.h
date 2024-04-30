@@ -183,7 +183,7 @@ void fairlock_acquire(fairlock_t *lock) {
     }
     info->detector = (double)info->bad_acquires/info->lock_acquires;
 
-    if (info->detector >= 0.5 && info->in_subq == 1){
+    if (info->detector >= 0.1 && info->in_subq == 1){
         info->in_subq = 0;
         goto begin;
     }
@@ -192,7 +192,7 @@ void fairlock_acquire(fairlock_t *lock) {
         ull curr_slice = lock->slice;
         qnode_t *succ = readvol(lock->qnext);
     
-        if (info->detector<0.5 && info->in_subq == 1 && (now = rdtsc()) < curr_slice){
+        if (info->detector<0.1 && info->in_subq == 1 && (now = rdtsc()) < curr_slice){
             info->here1++;
             if (rdtsc()>= lock->slice){
                 goto begin;
@@ -299,7 +299,7 @@ begin:
     }
 
     qnode_t n = { 0 };
-    if (info->detector < 0.5){
+    if (info->detector < 0.1){
         n.is_good = 1;
     }else{
         n.is_good = 0;
@@ -425,6 +425,10 @@ begin:
 #ifdef DEBUG
                 info->stat.prev_slice_wait += rdtsc() - now;
 #endif
+            }
+            if (n.is_good){
+                n.in_subq = 1;
+                info->in_subq = 1;
             }
             if (slice_valid) {
                 spin_then_yield(SPIN_LIMIT, (slice_valid = readvol(lock->slice_valid)) && rdtsc() < readvol(lock->slice));
